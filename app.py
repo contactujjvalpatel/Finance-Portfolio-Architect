@@ -8,7 +8,7 @@ from scipy.optimize import minimize
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Alpha-Gen Portfolio", layout="wide")
-st.title("⚡ Alpha-Gen: AI Portfolio Architect")
+st.title("Finance Portfolio Architect")
 
 # --- 1. CONFIGURATION ---
 FUNDS = {
@@ -202,4 +202,5 @@ with c2:
     daily_returns = df_prices[valid_funds].pct_change().dropna()
     w_ret = (daily_returns * pd.Series(weights)).sum(axis=1)
     cum_ret = (1 + w_ret).cumprod()
+
     st.line_chart(cum_ret)
