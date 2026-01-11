@@ -8,8 +8,7 @@ from scipy.optimize import minimize
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Alpha-Gen Pro", layout="wide", page_icon="⚡")
-st.title("⚡ Alpha-Gen: AI Portfolio Architect")
-st.markdown("### *Institutional-Grade Portfolio Optimization*")
+st.title("⚡ Finance Portfolio Architect")
 
 # --- 1. CONFIGURATION (EXPANDED UNIVERSE) ---
 FUNDS = {
@@ -252,3 +251,4 @@ if run_optimization:
 
 else:
     st.info("👈 Select your preferences and click **'Architect Portfolio'** to start.")
+
