@@ -38,11 +38,10 @@ FUNDS = {
     }
 }
 
-# --- 2. ROBUST DATA ENGINE ---
+# --- 2. ROBUST DATA ENGINE (With Sanitizer) ---
 @st.cache_data(ttl=3600)
 def get_data(fund_codes):
     data = {}
-    # Header to look like a browser (Fixes 403 Forbidden Error)
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
     
     for name, code in fund_codes.items():
@@ -58,64 +57,88 @@ def get_data(fund_codes):
             df['date'] = pd.to_datetime(df['date'], format='%d-%m-%Y')
             df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
             
-            # Store clean series
-            data[name] = df.set_index('date')['nav'].sort_index()
+            # Sort is crucial for pct_change
+            series = df.set_index('date')['nav'].sort_index()
+            
+            # DATA SANITIZER: Ignore funds with too little history
+            if len(series) < 200: continue 
+            
+            data[name] = series
         except:
             continue
     
     if not data: return pd.DataFrame()
     
-    # Align and Clean Data
+    # Combine and Clean
     df = pd.concat(data.values(), keys=data.keys(), axis=1)
-    df = df.ffill() # Fix: Forward fill missing dates (holidays)
+    df = df.ffill() # Fill gaps
     
-    # Filter last 3 years
+    # Filter last 3 years to ensure relevance
     start_date = datetime.now() - timedelta(days=365*3)
     df = df[df.index >= start_date]
-    df = df.dropna() # Drop rows that are still empty
+    
+    # Drop "Ghost" Rows (where funds haven't started yet)
+    df = df.dropna() 
     
     return df
 
-# --- 3. MATH ENGINE (Stable Scipy Version) ---
+# --- 3. MATH ENGINE (Corrected Annualization) ---
 def optimize_portfolio(prices, risk_profile):
+    # 1. Calculate Returns
     returns = prices.pct_change().dropna()
-    mean_returns = returns.mean() * 252
-    cov_matrix = returns.cov() * 252
+    
+    # SANITIZER: Remove "Flat" funds (Zero Volatility)
+    # If a fund has std dev = 0, it breaks the optimizer
+    valid_cols = returns.std() > 0.0001
+    returns = returns.loc[:, valid_cols]
+    
+    if returns.empty:
+        return None, None, None
+        
+    # 2. Annualize Inputs
+    # Daily Mean * 252 = Annual Mean
+    mean_returns = returns.mean() * 252 
+    # Daily Cov * 252 = Annual Cov
+    cov_matrix = returns.cov() * 252    
+    
     num_assets = len(mean_returns)
     
+    # 3. Define Optimization Objectives
     def portfolio_volatility(weights):
+        # Result is Annualized Standard Deviation
         return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
     
     def negative_sharpe(weights):
         p_ret = np.sum(mean_returns * weights)
-        p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-        return -(p_ret - 0.065) / p_vol
+        p_vol = portfolio_volatility(weights)
+        # Risk Free Rate = 6.5% (0.065)
+        return -(p_ret - 0.065) / p_vol 
     
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
     bounds = tuple((0.0, 1.0) for _ in range(num_assets))
     
+    # 4. Risk Profiles
+    init_guess = num_assets * [1./num_assets,]
+    
     if risk_profile == "Conservative":
-        # Max 20% per fund, minimize risk
-        bounds = tuple((0.0, 0.20) for _ in range(num_assets))
-        result = minimize(portfolio_volatility, num_assets*[1./num_assets,], 
+        bounds = tuple((0.0, 0.25) for _ in range(num_assets))
+        result = minimize(portfolio_volatility, init_guess, 
                          method='SLSQP', bounds=bounds, constraints=constraints)
     elif risk_profile == "Moderate":
-        # Max 35% per fund, maximize sharpe
-        bounds = tuple((0.0, 0.35) for _ in range(num_assets))
-        result = minimize(negative_sharpe, num_assets*[1./num_assets,], 
+        bounds = tuple((0.0, 0.40) for _ in range(num_assets))
+        result = minimize(negative_sharpe, init_guess, 
                          method='SLSQP', bounds=bounds, constraints=constraints)
     else: # Aggressive
-        # Max 60% per fund, maximize sharpe
         bounds = tuple((0.0, 0.60) for _ in range(num_assets))
-        result = minimize(negative_sharpe, num_assets*[1./num_assets,], 
+        result = minimize(negative_sharpe, init_guess, 
                          method='SLSQP', bounds=bounds, constraints=constraints)
     
-    return result.x, mean_returns, cov_matrix
+    return result.x, mean_returns, cov_matrix, returns.columns
 
 # --- 4. SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Preferences")
-    risk = st.radio("Risk Appetite", ["Conservative", "Moderate", "Aggressive"], index=2)
+    risk = st.radio("Risk Appetite", ["Conservative", "Moderate", "Aggressive"], index=1)
     cats = st.multiselect("Categories", list(FUNDS.keys()), default=["Small Cap", "Mid Cap", "Flexi/Multi Cap"])
     budget = st.number_input("Investment (₹)", value=100000, step=5000)
 
@@ -131,14 +154,19 @@ with st.spinner("Fetching market data..."):
     df_prices = get_data(selected_funds)
 
 if df_prices.empty:
-    st.error("❌ No common data found. Try selecting different categories.")
+    st.error("❌ No overlapping data found. Try different funds.")
     st.stop()
 
 # Run Math
-weights_array, mu, sigma = optimize_portfolio(df_prices, risk)
-weights = dict(zip(df_prices.columns, weights_array))
+weights_array, mu, sigma, valid_funds = optimize_portfolio(df_prices, risk)
 
-# Calculate Specs
+if weights_array is None:
+    st.error("❌ Optimization failed. Data was too flat/stable to calculate risk.")
+    st.stop()
+
+weights = dict(zip(valid_funds, weights_array))
+
+# Calculate Specs (Explicitly Annualized)
 final_ret = np.sum(mu * weights_array)
 final_vol = np.sqrt(np.dot(weights_array.T, np.dot(sigma, weights_array)))
 final_sharpe = (final_ret - 0.065) / final_vol
@@ -157,16 +185,21 @@ with col1:
     st.dataframe(df_show[["Fund", "Alloc", "Amt"]], use_container_width=True, hide_index=True)
 
 with col2:
-    st.subheader("📊 Specs")
+    st.subheader("📊 Annualized Specs")
     st.metric("Expected Return", f"{final_ret*100:.1f}%")
-    st.metric("Risk (Vol)", f"{final_vol*100:.1f}%")
+    st.metric("Risk (Volatility)", f"{final_vol*100:.1f}%")
     st.metric("Sharpe Ratio", f"{final_sharpe:.2f}")
 
 st.divider()
+
+# Charts
 c1, c2 = st.columns(2)
 with c1:
     st.plotly_chart(px.pie(df_show, values='Amt', names='Fund', hole=0.4), use_container_width=True)
 with c2:
-    st.subheader("Historical Trajectory (3Y)")
-    w_ret = (df_prices.pct_change() * pd.Series(weights)).sum(axis=1)
-    st.line_chart((1 + w_ret).cumprod())
+    st.subheader("Historical Growth (3Y)")
+    # Re-calculate daily weighted returns for the chart
+    daily_returns = df_prices[valid_funds].pct_change().dropna()
+    w_ret = (daily_returns * pd.Series(weights)).sum(axis=1)
+    cum_ret = (1 + w_ret).cumprod()
+    st.line_chart(cum_ret)
