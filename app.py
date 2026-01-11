@@ -38,60 +38,75 @@ FUNDS = {
     }
 }
 
-# --- 2. DATA ENGINE ---
+# --- 2. ROBUST DATA ENGINE ---
 @st.cache_data(ttl=3600)
 def get_data(fund_codes):
     data = {}
+    # Header to look like a browser (Fixes 403 Forbidden Error)
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
+    
     for name, code in fund_codes.items():
         try:
             url = f"https://api.mfapi.in/mf/{code}"
-            resp = requests.get(url, timeout=5).json()
-            if resp['status'] == 'FAIL': continue
-            df = pd.DataFrame(resp['data'])
+            resp = requests.get(url, headers=headers, timeout=5)
+            if resp.status_code != 200: continue
+            
+            resp_json = resp.json()
+            if resp_json['status'] == 'FAIL': continue
+            
+            df = pd.DataFrame(resp_json['data'])
             df['date'] = pd.to_datetime(df['date'], format='%d-%m-%Y')
             df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
+            
+            # Store clean series
             data[name] = df.set_index('date')['nav'].sort_index()
         except:
             continue
     
     if not data: return pd.DataFrame()
     
-    # Align and filter last 3 years
-    df = pd.concat(data.values(), keys=data.keys(), axis=1).dropna()
+    # Align and Clean Data
+    df = pd.concat(data.values(), keys=data.keys(), axis=1)
+    df = df.ffill() # Fix: Forward fill missing dates (holidays)
+    
+    # Filter last 3 years
     start_date = datetime.now() - timedelta(days=365*3)
-    return df[df.index >= start_date]
+    df = df[df.index >= start_date]
+    df = df.dropna() # Drop rows that are still empty
+    
+    return df
 
-# --- 3. MATH ENGINE (No-Dependency Version) ---
+# --- 3. MATH ENGINE (Stable Scipy Version) ---
 def optimize_portfolio(prices, risk_profile):
-    # Calculate returns and covariance
     returns = prices.pct_change().dropna()
     mean_returns = returns.mean() * 252
     cov_matrix = returns.cov() * 252
     num_assets = len(mean_returns)
     
-    # Define Objectives
     def portfolio_volatility(weights):
         return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
     
     def negative_sharpe(weights):
-        p_ret = np.sum(returns.mean() * weights) * 252
+        p_ret = np.sum(mean_returns * weights)
         p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-        return -(p_ret - 0.065) / p_vol # Assuming 6.5% risk free
+        return -(p_ret - 0.065) / p_vol
     
-    # Constraints
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+    bounds = tuple((0.0, 1.0) for _ in range(num_assets))
     
-    # Risk Bounds (The Logic)
     if risk_profile == "Conservative":
-        bounds = tuple((0.0, 0.20) for _ in range(num_assets)) # Max 20% per fund
+        # Max 20% per fund, minimize risk
+        bounds = tuple((0.0, 0.20) for _ in range(num_assets))
         result = minimize(portfolio_volatility, num_assets*[1./num_assets,], 
                          method='SLSQP', bounds=bounds, constraints=constraints)
     elif risk_profile == "Moderate":
-        bounds = tuple((0.0, 0.35) for _ in range(num_assets)) # Max 35% per fund
+        # Max 35% per fund, maximize sharpe
+        bounds = tuple((0.0, 0.35) for _ in range(num_assets))
         result = minimize(negative_sharpe, num_assets*[1./num_assets,], 
                          method='SLSQP', bounds=bounds, constraints=constraints)
     else: # Aggressive
-        bounds = tuple((0.0, 0.60) for _ in range(num_assets)) # Max 60% per fund
+        # Max 60% per fund, maximize sharpe
+        bounds = tuple((0.0, 0.60) for _ in range(num_assets))
         result = minimize(negative_sharpe, num_assets*[1./num_assets,], 
                          method='SLSQP', bounds=bounds, constraints=constraints)
     
@@ -116,7 +131,7 @@ with st.spinner("Fetching market data..."):
     df_prices = get_data(selected_funds)
 
 if df_prices.empty:
-    st.error("❌ Data Fetch Error. Check internet.")
+    st.error("❌ No common data found. Try selecting different categories.")
     st.stop()
 
 # Run Math
@@ -139,7 +154,6 @@ with col1:
             alloc.append({"Fund": name, "Alloc": f"{w*100:.1f}%", "Amt": int(w * budget), "Raw": w})
     
     df_show = pd.DataFrame(alloc).sort_values("Raw", ascending=False)
-    # THIS WAS THE LINE THAT CAUSED THE ERROR
     st.dataframe(df_show[["Fund", "Alloc", "Amt"]], use_container_width=True, hide_index=True)
 
 with col2:
